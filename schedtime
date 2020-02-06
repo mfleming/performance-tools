@@ -303,60 +303,63 @@ if __name__ == '__main__':
         if len(kstack) < 3:
             continue
 
-        io_funcs = { "io_schedule", "wait_transaction_locked", "pipe_read", "pipe_write", "jbd2_log_wait_commit" }
-        if kstack[2] in io_funcs:
-            group = "disk io"
-        elif kstack[2] == "do_wait":
-            group  = "voluntary wait"
-        elif kstack[2] == "exit_to_usermode_loop":
-            continue
-        elif kstack[-1] == "ret_from_fork":
-            continue
-        elif kstack[2] == "do_nanosleep":
-            group = "voluntary wait"
-        elif kstack[2] == "sigsuspend":
-            group = "voluntary wait"
-        elif kstack[2] == "futex_wait_queue_me":
-            group = "userspace locking"
-        elif kstack[2] == "schedule_hrtimeout_range_clock":
-            if kstack[5] == "do_epoll_wait":
-                group = "disk io"
-        elif kstack[1] == "_cond_resched":
-            group = "involuntary preempt"
-        elif kstack[1] == "__cond_resched_lock":
-            group = "involuntary preempt"
-        elif kstack[2] == "d_alloc_parallel":
-            group = "involuntary preempt"
-        elif kstack[2] == "rwsem_down_write_slowpath":
-            group = "kernel locking"
-        elif kstack[2] == "rwsem_down_read_slowpath":
-            group = "kernel locking"
-        elif kstack[3] == "wait_for_completion_killable":
-            # This catches vfork(). Not sure this is in the correct bucket
-            group = "involuntary preempt"
-        elif kstack[3] == "__skb_wait_for_more_packets":
-            group = "network io"
-        elif kstack[3] == "unix_stream_read_generic":
-            group = "network io"
-        elif kstack[3] == "msleep":
-            group = "involuntary preempt"
-        elif kstack[3] == "wait_for_completion":
-            group = "involuntary preempt"
-        elif kstack[3] == "__mutex_lock.isra.9":
-            group = "kernel locking"
-        elif kstack[-1] == 'page_fault':
-            group = "page faults"
-        elif kstack[1] == "schedule_idle":
-            # Idle loop
-            continue
-        else:
-            print("Unknown schedule reason")
-            kernel_stack = stack_traces.walk(k.kernel_stack_id)
-            for addr in kernel_stack:
-                print("    %s" % b.ksym(addr))
+        # Some stacks don't have enough information to analyse.
+        # Short-circut here.
+        short_circuits = [ "exit_to_usermode_loop", "ret_from_fork" ]
+        skip = False
+        for s in short_circuits:
+            if s in kstack:
+                skip = True
+
+        if skip:
             continue
 
-        tasks[pid].times[group] += v.value
+        func_maps = {
+                "io_schedule": "disk io",
+                "wait_transaction_locked": "disk io",
+                "pipe_read": "disk io",
+                "pipe_write": "disk io",
+                "jbd2_log_wait_commit": "disk io",
+                "do_epoll_wait": "disk io",
+
+                "do_wait": "voluntary wait",
+                "do_nanosleep": "voluntary wait",
+
+                "_cond_resched": "involuntary preempt",
+                "__cond_resched_lock": "involuntary preempt",
+                "d_alloc_parallel": "involuntary preempt",
+                # This catches vfork(). Not sure this is in the correct bucket
+                "wait_for_completion_killable": "involuntary preempt",
+                "msleep": "involuntary preempt",
+                "wait_for_completion": "involuntary preempt",
+
+                "futex_wait_queue_me": "userspace locking",
+
+                "rwsem_down_write_slowpath": "kernel locking",
+                "rwsem_down_read_slowpath": "kernel locking",
+                "__mutex_lock.isra.9": "kernel locking",
+
+                "__skb_wait_for_more_packets": "network io",
+                "unix_stream_read_generic": "network io",
+
+                "page_fault": "page faults",
+        }
+
+        group = None
+        for func in func_maps:
+            if func in kstack:
+                group = func_maps[func]
+                break
+
+        if group:
+                tasks[pid].times[group] += v.value
+                continue
+
+        print("Unknown schedule reason")
+        kernel_stack = stack_traces.walk(k.kernel_stack_id)
+        for addr in kernel_stack:
+            print("    %s" % b.ksym(addr))
+
 
     total = {}
     unit = "ms" if args.milliseconds else "s"
