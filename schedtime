@@ -321,6 +321,7 @@ if __name__ == '__main__':
                 "pipe_write": "disk io",
                 "jbd2_log_wait_commit": "disk io",
                 "do_epoll_wait": "disk io",
+                "wait_woken": "disk io",
 
                 "do_wait": "voluntary wait",
                 "do_nanosleep": "voluntary wait",
