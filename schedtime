@@ -1,0 +1,396 @@
+#!/usr/bin/env python
+#
+# Copyright 2020 Matt Fleming
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# schedtime - Display a task run time statistics using scheduler hooks.
+#
+# Unlike bash's time built-in schedtime includes off-cpu time in its results.
+#
+
+from __future__ import print_function
+from bcc import BPF
+import argparse
+import os
+import signal
+import sys
+import subprocess
+import time
+
+source="""
+#include <uapi/linux/ptrace.h>
+#include <linux/sched.h>
+
+struct data_item {
+    u32 pid;
+    u32 tgid;
+    int kernel_stack_id;
+};
+
+struct pid_item {
+    u32 parent;
+    u32 child;
+};
+
+struct task_lifetime {
+    u32 pid;
+    u64 delta;
+    u32 dead;
+};
+
+BPF_HASH(events, struct data_item);
+BPF_HASH(start, u32);
+BPF_STACK_TRACE(stack_traces, 40960);
+BPF_HASH(pids, struct pid_item);
+BPF_HASH(task_lifetime, u32, struct task_lifetime);
+
+int wake_up_probe(struct pt_regs *ctx, struct task_struct *p)
+{
+    struct pid_item pid = {};
+    struct task_lifetime tl = {};
+    u64 one = 1;
+    u64 now;
+    u32 child = p->pid;
+
+    // Don't trace kernel threads
+    if (p->flags & PF_KTHREAD)
+        return 0;
+
+    pid.parent = bpf_get_current_pid_tgid();
+    pid.child = child;
+
+    pids.update(&pid, &one);
+
+    now = bpf_ktime_get_ns();
+    tl.pid = child;
+    tl.delta = now;
+    task_lifetime.update(&child, &tl);
+
+    return 0;
+}
+
+int sched_in(struct pt_regs *ctx, struct task_struct *prev) {
+    struct data_item data = {};
+    u32 pid = prev->pid;
+    u32 ppid;
+    u32 tgid;
+    u64 ts, *tsp;
+    u64 delta;
+
+    // We may never see 'prev' again if it's a dying task. Update its stats.
+    ts = bpf_ktime_get_ns();
+    start.update(&pid, &ts);
+
+    // get the current thread's start time
+    pid = bpf_get_current_pid_tgid();
+    tgid = bpf_get_current_pid_tgid() >> 32;
+    tsp = start.lookup(&pid);
+    if (tsp == 0)
+        return 0;
+
+    // calculate current thread's delta time
+    delta = bpf_ktime_get_ns() - *tsp;
+    start.delete(&pid);
+    delta = delta / 1000;
+
+    data.pid = pid;
+    data.tgid = tgid;
+    data.kernel_stack_id = stack_traces.get_stackid(ctx, 0);
+
+    events.increment(data, delta);
+
+    return 0;
+}
+
+int dead_task(struct pt_regs *ctx, struct task_struct *p)
+{
+    u64 *begin, delta;
+    u64 now = bpf_ktime_get_ns();
+    u32 pid = p->pid;
+    struct task_lifetime *tl;
+
+    tl = task_lifetime.lookup(&pid);
+    if (!tl)
+        return 0;
+
+    delta = now - tl->delta;
+    if ((s64)delta <= 0)
+        delta = 1000;
+    tl->delta = delta / 1000;
+    tl->dead = 1;
+    task_lifetime.update(&pid, tl);
+    return 0;
+}
+"""
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+args = None
+
+def time_unit(us_val):
+    return us_val / 1000.0 if args.milliseconds else us_val / 1000.0 / 1000.0
+
+def pct(x, total):
+    return 0.0 if x == 0 else x / total * 100.0
+
+# Breadth-first search
+#
+# Find all vertices reachable from source vertex s.
+def BFS(s, edges):
+    # Build adjacency lists
+    adj = {s: []}
+    for k,v in edges:
+        if k.parent in adj:
+            adj[k.parent].append(k.child)
+        else:
+            adj[k.parent] = [k.child]
+
+        if k.child not in adj:
+            adj[k.child] = []
+
+    vertices = set()
+    for k, v in edges:
+        vertices.add(k.parent)
+        vertices.add(k.child)
+
+    WHITE = 0
+    GREY = 1
+    BLACK = 2
+
+    colour = {}
+    parent = {}
+
+    for u in vertices:
+        colour[u] = WHITE
+        parent[u] = None
+
+    colour[s] = GREY
+    q = [s]
+    while q:
+        u = q.pop(0)    # FIFO queue
+        for v in adj[u]:
+            if colour[v] == WHITE:
+                colour[v] = GREY
+                parent[v] = u
+                q.append(v)
+        colour[u] = BLACK
+
+    return [u for u in colour if colour[u] == BLACK]
+
+class Task(object):
+    """A Linux task (thread)"""
+    def __init__(self, pid):
+        self.lifetime = 0
+        self.pid = pid
+        self.times = {
+                "disk io": 0,
+                "voluntary wait": 0,
+                "involuntary preempt": 0,
+                "userspace locking": 0,
+                "kernel locking": 0,
+                "network io": 0,
+                "page faults": 0
+        }
+
+    def __str__(self):
+        absolute = self.lifetime - sum([self.times[g] for g in self.times])
+        unit = "ms" if args.milliseconds else "s"
+        oncpu = { "abs": absolute, "pct": pct(absolute, self.lifetime)}
+
+        return "  [{0:d}] lifetime: {1:.2f}{2:s}, on-cpu: {3:.2f}{4:s} ({5:.1f}%)\n" \
+               "\n" \
+               "        userspace locking: {6: >6.2f}{7:s} ({8:>4.1f}%)\n" \
+               "           userspace wait: {9: >6.2f}{10:s} ({11:>4.1f}%)\n"\
+               "\n" \
+               "           kernel locking: {12: >6.2f}{13:s} ({14:>4.1f}%)\n" \
+               "              kernel wait: {15: >6.2f}{16:s} ({17:>4.1f}%)\n" \
+               "\n" \
+               "              network i/o: {18: >6.2f}{19:s} ({20:>4.1f}%)\n" \
+               "                 disk i/o: {21: >6.2f}{22:s} ({23:>4.1f}%)\n" \
+               "\n" \
+               "              page faults: {24: >6.2f}{25:s} ({26:>4.1f}%)\n" \
+               .format(
+                self.pid, time_unit(self.lifetime), unit, time_unit(oncpu["abs"]), unit, oncpu["pct"],
+                time_unit(self.times["userspace locking"]), unit, self.pct("userspace locking"),
+                time_unit(self.times["voluntary wait"]), unit, self.pct("voluntary wait"),
+                time_unit(self.times["kernel locking"]), unit, self.pct("kernel locking"),
+                time_unit(self.times["involuntary preempt"]), unit, self.pct("involuntary preempt"),
+                time_unit(self.times["network io"]), unit, self.pct("network io"),
+                time_unit(self.times["disk io"]), unit, self.pct("disk io"),
+                time_unit(self.times["page faults"]), unit, self.pct("page faults"),
+                )
+
+    def pct(self, group):
+        return pct(self.times[group], self.lifetime)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(
+            description="Summarise scheduler time statistics for tasks",
+            formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("-v", "--verbose", action="store_true",
+            help="display verbose time statistics for each task individually")
+    parser.add_argument("-m", "--milliseconds", action="store_true",
+            help="display time in milliseconds")
+    parser.add_argument("command",  help="comamand to execute")
+    parser.add_argument("args", nargs=argparse.REMAINDER)
+    args = parser.parse_args()
+
+    b = BPF(text=source)
+
+    b.attach_kprobe(event="finish_task_switch", fn_name="sched_in")
+    b.attach_kprobe(event="wake_up_new_task", fn_name="wake_up_probe")
+    b.attach_kprobe(event="exit_thread", fn_name="dead_task")
+
+    proc = subprocess.Popen([args.command] + args.args)
+    stderr, stdout = proc.communicate()
+    proc.wait()
+
+    tasks = {}
+    p = b.get_table("pids")
+    for p in BFS(proc.pid, p.items()):
+        tasks[p] = Task(p)
+    
+    # Unfortunately some tasks may not be gone through do_exit() by the
+    # time we try to read their lifetimes.
+    wall_time = 0.0
+    lifetimes = b.get_table("task_lifetime")
+    ltimes = []
+    for k, v in lifetimes.items():
+        if k.value in tasks and v.dead:
+            t = tasks[k.value]
+            t.lifetime = v.delta
+            ltimes.append(k.value)
+        if k.value == proc.pid:
+            wall_time = v.delta
+
+    # XXX This shouldn't be needed. How do we even end up with tasks in
+    # the BFS tree if we haven't recorded their lifetime?
+    bad_tasks = [t for t in tasks if tasks[t].lifetime == 0]
+    for t in bad_tasks:
+        del tasks[t]
+
+    events = b.get_table("events")
+    stack_traces = b.get_table("stack_traces")
+    for k, v in sorted(events.items(), key=lambda counts:
+            counts[1].value):
+
+        kernel_stack = [] if k.kernel_stack_id < 0 else \
+            stack_traces.walk(k.kernel_stack_id)
+
+        pid = k.pid
+        if pid not in tasks:
+            continue
+
+        # The call stack should look like this:
+        # finish_task_switch()
+        # schedule()
+        # [exit_to_usermode_loop | io_schedule | do_wait]
+        kstack = [b.ksym(addr).decode("utf-8") for addr in kernel_stack]
+
+        if len(kstack) < 3:
+            continue
+
+        io_funcs = { "io_schedule", "wait_transaction_locked", "pipe_read", "pipe_write", "jbd2_log_wait_commit" }
+        if kstack[2] in io_funcs:
+            group = "disk io"
+        elif kstack[2] == "do_wait":
+            group  = "voluntary wait"
+        elif kstack[2] == "exit_to_usermode_loop":
+            continue
+        elif kstack[-1] == "ret_from_fork":
+            continue
+        elif kstack[2] == "do_nanosleep":
+            group = "voluntary wait"
+        elif kstack[2] == "sigsuspend":
+            group = "voluntary wait"
+        elif kstack[2] == "futex_wait_queue_me":
+            group = "userspace locking"
+        elif kstack[2] == "schedule_hrtimeout_range_clock":
+            if kstack[5] == "do_epoll_wait":
+                group = "disk io"
+        elif kstack[1] == "_cond_resched":
+            group = "involuntary preempt"
+        elif kstack[1] == "__cond_resched_lock":
+            group = "involuntary preempt"
+        elif kstack[2] == "d_alloc_parallel":
+            group = "involuntary preempt"
+        elif kstack[2] == "rwsem_down_write_slowpath":
+            group = "kernel locking"
+        elif kstack[2] == "rwsem_down_read_slowpath":
+            group = "kernel locking"
+        elif kstack[3] == "wait_for_completion_killable":
+            # This catches vfork(). Not sure this is in the correct bucket
+            group = "involuntary preempt"
+        elif kstack[3] == "__skb_wait_for_more_packets":
+            group = "network io"
+        elif kstack[3] == "unix_stream_read_generic":
+            group = "network io"
+        elif kstack[3] == "msleep":
+            group = "involuntary preempt"
+        elif kstack[3] == "wait_for_completion":
+            group = "involuntary preempt"
+        elif kstack[3] == "__mutex_lock.isra.9":
+            group = "kernel locking"
+        elif kstack[-1] == 'page_fault':
+            group = "page faults"
+        elif kstack[1] == "schedule_idle":
+            # Idle loop
+            continue
+        else:
+            print("Unknown schedule reason")
+            kernel_stack = stack_traces.walk(k.kernel_stack_id)
+            for addr in kernel_stack:
+                print("    %s" % b.ksym(addr))
+            continue
+
+        tasks[pid].times[group] += v.value
+
+    total = {}
+    unit = "ms" if args.milliseconds else "s"
+    total["abs"] = sum([tasks[t].lifetime for t in tasks])
+
+    calc_time = lambda l: sum([tasks[t].times[g] for t in tasks for g in l])
+
+    io = {}
+    io["abs"] = calc_time(["disk io", "network io"])
+    io["pct"] = pct(io["abs"], total["abs"])
+
+    uwait = {}
+    uwait["abs"] = calc_time(["voluntary wait", "userspace locking"])
+    uwait["pct"] = pct(uwait["abs"], total["abs"])
+    
+    kwait = {}
+    kwait["abs"] = calc_time(["involuntary preempt", "kernel locking", "page faults"])
+    kwait["pct"] = pct(kwait["abs"], total["abs"])
+
+    oncpu = {}
+    oncpu["abs"] = total["abs"] - io["abs"] - uwait["abs"] - kwait["abs"]
+    oncpu["pct"] = pct(oncpu["abs"], total["abs"])
+
+    eprint("total: %.2f%s, wall: %.2f%s, on-cpu: %.2f%s (%.1f%%), user wait: %.2f%s (%.1f%%), kernel wait: %.2f%s (%.1f%%), i/o: %.2f%s (%.1f%%)" %
+        (time_unit(total["abs"]), unit, time_unit(wall_time), unit,
+            time_unit(oncpu["abs"]), unit, oncpu["pct"],
+            time_unit(uwait["abs"]), unit, uwait["pct"],
+            time_unit(kwait["abs"]), unit, kwait["pct"],
+            time_unit(io["abs"]), unit, io["pct"]))
+
+    if not args.verbose:
+        sys.exit(0)
+
+    eprint("\ntasks (%d):" % (len(tasks)))
+    for t in tasks:
+        task = tasks[t]
+        eprint(task)
