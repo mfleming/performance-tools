@@ -327,6 +327,7 @@ if __name__ == '__main__':
                 "do_wait": "voluntary wait",
                 "do_nanosleep": "voluntary wait",
                 "sigsuspend": "voluntary wait",
+                "do_sched_yield": "voluntary wait",
 
                 "_cond_resched": "involuntary preempt",
                 "__cond_resched_lock": "involuntary preempt",
@@ -335,6 +336,7 @@ if __name__ == '__main__':
                 "wait_for_completion_killable": "involuntary preempt",
                 "msleep": "involuntary preempt",
                 "wait_for_completion": "involuntary preempt",
+                "expand_files": "involuntary preempt",
 
                 "futex_wait_queue_me": "userspace locking",
 
