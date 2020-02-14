@@ -319,6 +319,7 @@ if __name__ == '__main__':
 
         func_maps = {
                 "io_schedule": "disk io",
+                "io_schedule_timeout": "disk io",
                 "wait_transaction_locked": "disk io",
                 "pipe_read": "disk io",
                 "pipe_write": "disk io",
