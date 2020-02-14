@@ -255,8 +255,11 @@ if __name__ == '__main__':
     b.attach_kprobe(event="exit_thread", fn_name="dead_task")
 
     proc = subprocess.Popen([args.command] + args.args)
-    stderr, stdout = proc.communicate()
-    proc.wait()
+    try:
+        stderr, stdout = proc.communicate()
+        proc.wait()
+    except KeyboardInterrupt:
+        pass
 
     tasks = {}
     p = b.get_table("pids")
