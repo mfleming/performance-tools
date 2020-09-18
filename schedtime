@@ -47,6 +47,7 @@ struct task_lifetime {
     u32 pid;
     u64 delta;
     u32 dead;
+    char comm[TASK_COMM_LEN];
 };
 
 BPF_HASH(events, struct data_item);
@@ -129,6 +130,7 @@ int dead_task(struct pt_regs *ctx, struct task_struct *p)
         delta = 1000;
     tl->delta = delta / 1000;
     tl->dead = 1;
+    bpf_get_current_comm(&tl->comm, sizeof(tl->comm));
     task_lifetime.update(&pid, tl);
     return 0;
 }
@@ -194,6 +196,7 @@ class Task(object):
     def __init__(self, pid):
         self.lifetime = 0
         self.pid = pid
+        self.comm = ""
         self.times = {
                 "disk io": 0,
                 "voluntary wait": 0,
@@ -209,7 +212,7 @@ class Task(object):
         unit = "ms" if args.milliseconds else "s"
         oncpu = { "abs": absolute, "pct": pct(absolute, self.lifetime)}
 
-        return "  [{0:d}] lifetime: {1:.2f}{2:s}, on-cpu: {3:.2f}{4:s} ({5:.1f}%)\n" \
+        return "  [{27:s}-{0:d}] lifetime: {1:.2f}{2:s}, on-cpu: {3:.2f}{4:s} ({5:.1f}%)\n" \
                "\n" \
                "        userspace locking: {6: >6.2f}{7:s} ({8:>4.1f}%)\n" \
                "           userspace wait: {9: >6.2f}{10:s} ({11:>4.1f}%)\n"\
@@ -230,6 +233,7 @@ class Task(object):
                 time_unit(self.times["network io"]), unit, self.pct("network io"),
                 time_unit(self.times["disk io"]), unit, self.pct("disk io"),
                 time_unit(self.times["page faults"]), unit, self.pct("page faults"),
+                self.comm,
                 )
 
     def pct(self, group):
@@ -276,6 +280,7 @@ if __name__ == '__main__':
         if k.value in tasks and v.dead:
             t = tasks[k.value]
             t.lifetime = v.delta
+            t.comm = v.comm.decode()
             ltimes.append(k.value)
         if k.value == proc.pid:
             wall_time = v.delta
