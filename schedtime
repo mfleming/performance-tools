@@ -136,8 +136,9 @@ int dead_task(struct pt_regs *ctx, struct task_struct *p)
 }
 """
 
+fh = sys.stdout
 def eprint(*args, **kwargs):
-    print(*args, file=sys.stderr, **kwargs)
+    print(*args, file=fh, **kwargs)
 
 args = None
 
@@ -250,9 +251,14 @@ if __name__ == '__main__':
             help="display verbose time statistics for each task individually")
     parser.add_argument("-m", "--milliseconds", action="store_true",
             help="display time in milliseconds")
+    parser.add_argument("-o", "--output",
+            help="write output to file instead of stdout")
     parser.add_argument("command",  help="comamand to execute")
     parser.add_argument("args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+
+    if args.output:
+        fh = open(args.output, 'w')
 
     b = BPF(text=source)
 
@@ -414,3 +420,6 @@ if __name__ == '__main__':
     for t in tasks:
         task = tasks[t]
         eprint(task)
+
+    if fh is not sys.stdout:
+        fh.close()
