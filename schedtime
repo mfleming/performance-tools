@@ -212,7 +212,9 @@ class Task(object):
         unit = "ms" if args.milliseconds else "s"
         oncpu = { "abs": absolute, "pct": pct(absolute, self.lifetime)}
 
-        return "  [{27:s}-{0:d}] lifetime: {1:.2f}{2:s}, on-cpu: {3:.2f}{4:s} ({5:.1f}%)\n" \
+        return "  [{27:s}-{0:d}] lifetime: {1:.2f}{2:s}\n" \
+               "\n" \
+               "                   on-cpu: {3: >6.2f}{4:s} ({5:>4.1f}%)\n" \
                "\n" \
                "        userspace locking: {6: >6.2f}{7:s} ({8:>4.1f}%)\n" \
                "           userspace wait: {9: >6.2f}{10:s} ({11:>4.1f}%)\n"\
