@@ -257,9 +257,10 @@ if __name__ == '__main__':
     proc = subprocess.Popen([args.command] + args.args)
     try:
         stderr, stdout = proc.communicate()
-        proc.wait()
     except KeyboardInterrupt:
         pass
+    finally:
+        proc.wait()
 
     tasks = {}
     p = b.get_table("pids")
