@@ -208,10 +208,13 @@ class Task(object):
                 "page faults": 0
         }
 
+    def total_time(self):
+        """Return the total time this task ran."""
+        return self.lifetime - sum([self.times[g] for g in self.times])
+
     def __str__(self):
-        absolute = self.lifetime - sum([self.times[g] for g in self.times])
         unit = "ms" if args.milliseconds else "s"
-        oncpu = { "abs": absolute, "pct": pct(absolute, self.lifetime)}
+        oncpu = { "abs": self.total_time(), "pct": pct(self.total_time(), self.lifetime)}
 
         return "  [{27:s}-{0:d}] lifetime: {1:.2f}{2:s}\n" \
                "\n" \
@@ -243,19 +246,76 @@ class Task(object):
         return pct(self.times[group], self.lifetime)
 
 
+def sort_task_data(tasks, args):
+    if not args.sort or args.sort == "lifetime":
+        return sorted([tasks[t] for t in tasks],
+                key=lambda t: t.lifetime, reverse=True)
+
+    if args.sort == "command":
+        return sorted([tasks[t] for t in tasks],
+                key=lambda t: t.comm, reverse=False)
+    if args.sort == "tid":
+        return sorted([tasks[t] for t in tasks],
+                key=lambda t: t.pid, reverse=False)
+    if args.sort == "cpu":
+        return sorted([tasks[t] for t in tasks],
+                key=lambda t: t.total_time(), reverse=True)
+    if args.sort == "disk":
+        return sorted([tasks[t] for t in tasks],
+                key=lambda t: t.times["disk io"], reverse=True)
+    if args.sort == "faults":
+        return sorted([tasks[t] for t in tasks],
+                key=lambda t: t.times["page faults"], reverse=True)
+    if args.sort == "net":
+        return sorted([tasks[t] for t in tasks],
+                key=lambda t: t.times["network io"], reverse=True)
+    if args.sort == "klock":
+        return sorted([tasks[t] for t in tasks],
+                key=lambda t: t.times["kernel locking"], reverse=True)
+    if args.sort == "kwait":
+        return sorted([tasks[t] for t in tasks],
+                key=lambda t: t.times["involuntary preempt"], reverse=True)
+    if args.sort == "ulock":
+        return sorted([tasks[t] for t in tasks],
+                key=lambda t: t.times["userspace locking"], reverse=True)
+    if args.sort == "uwait":
+        return sorted([tasks[t] for t in tasks],
+                key=lambda t: t.times["voluntary wait"], reverse=True)
+
+    print("Invalid sort key")
+    return []
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
             description="Summarise scheduler time statistics for tasks",
-            formatter_class=argparse.RawDescriptionHelpFormatter)
+            formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument("-v", "--verbose", action="store_true",
             help="display verbose time statistics for each task individually")
     parser.add_argument("-m", "--milliseconds", action="store_true",
             help="display time in milliseconds")
     parser.add_argument("-o", "--output",
             help="write output to file instead of stdout")
+    parser.add_argument("-s", "--sort",
+            help="sort the output of -v by one of: \n\n"
+                 "    lifetime - task lifetime (default),\n"
+                 "    command - the task command name,\n"
+                 "    tid - the task thread id,\n"
+                 "    cpu - on-cpu time,\n"
+                 "    disk - disk i/o time,\n"
+                 "    faults - page fault time,\n"
+                 "    net - network i/o time,\n"
+                 "    klock - kernel locking time,\n"
+                 "    kwait - kernel wait time,\n"
+                 "    ulock - userspace locking time,\n"
+                 "    uwait - userspace wait time\n\n"
+                 "    e.g. '-s cpu' sorts output by on-cpu time")
     parser.add_argument("command",  help="comamand to execute")
     parser.add_argument("args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
+
+    if args.sort and not args.verbose:
+        print("Error: -s requires -v")
+        sys.exit(1)
 
     if args.output:
         fh = open(args.output, 'w')
@@ -417,8 +477,7 @@ if __name__ == '__main__':
         sys.exit(0)
 
     eprint("\ntasks (%d):" % (len(tasks)))
-    for t in tasks:
-        task = tasks[t]
+    for task in sort_task_data(tasks, args):
         eprint(task)
 
     if fh is not sys.stdout:
